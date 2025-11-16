@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Chess Bot - Click to play</title>
+    <style>
+      :root{
+        --light:#f0d9b5;
+        --dark:#b58863;
+        --board-size: 480px;
+      }
+  body { font-family: Arial, sans-serif; padding: 20px; }
+  /* make board perfectly square and evenly spaced */
+  #board { width: var(--board-size); aspect-ratio: 1 / 1; display:grid; grid-template-columns: repeat(8, 1fr); grid-auto-rows: 1fr; border: 2px solid #333; }
+  .square { width:100%; height:100%; position:relative; box-sizing:border-box; display:flex; align-items:stretch; }
+      .square.light { background: var(--light); }
+      .square.dark { background: var(--dark); }
+      .square .coord { position:absolute; font-size:10px; color: rgba(0,0,0,0.5); bottom:2px; left:2px; }
+  .piece { width:100%; height:100%; display:flex; align-items:center; justify-content:center; cursor:pointer; }
+      #controls { margin-top: 12px; }
+  .highlight { outline: 3px solid rgba(255,255,0,0.6); box-sizing:border-box; }
+      #status { margin-left: 12px; }
+    </style>
+  </head>
+  <body>
+    <h2>Chess Bot — Click the board to move</h2>
+    <div id="board" style="width: 480px"></div>
+    <div id="endgame-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); align-items:center; justify-content:center;"> 
+      <div id="endgame-box" style="background:#fff; padding:20px; border-radius:8px; text-align:center; min-width:260px;">
+        <h2 id="endgame-title">Game over</h2>
+        <p id="endgame-msg"></p>
+        <button id="endgame-reset">Play again</button>
+      </div>
+    </div>
+    <div id="controls">
+      <label for="depth">Bot depth:</label>
+      <select id="depth"><option>2</option><option selected>3</option><option>4</option></select>
+      <button id="reset">Reset</button>
+      <span id="status"></span>
+    </div>
+
+    <script>
+      // Self-contained board renderer without external libraries.
+      const statusEl = document.getElementById('status');
+      const boardEl = document.getElementById('board');
+      const files = ['a','b','c','d','e','f','g','h'];
+      const ranks = ['8','7','6','5','4','3','2','1'];
+  let selected = null; // {sq: 'e2', el: DOM}
+  let gameOver = false;
+
+      function setStatus(t){ statusEl.textContent = t; }
+
+      // pieces unicode map
+      const PIECE_UNICODE = {
+        'P':'♙','N':'♘','B':'♗','R':'♖','Q':'♕','K':'♔',
+        'p':'♟','n':'♞','b':'♝','r':'♜','q':'♛','k':'♚'
+      };
+
+      function svgDataUriForChar(ch, size=120){
+        const color = (ch === ch.toUpperCase()) ? '#222' : '#222';
+        const text = PIECE_UNICODE[ch] || '';
+        const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='${size}' height='${size}' viewBox='0 0 ${size} ${size}'>`+
+          `<rect width='100%' height='100%' fill='none' />`+
+          `<text x='50%' y='58%' font-size='${size*0.7}' text-anchor='middle' dominant-baseline='middle' fill='${color}'>${text}</text>`+
+          `</svg>`;
+        return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+      }
+
+      // Map piece char to dataURI (cache)
+      const pieceDataURI = {};
+      for(const p of Object.keys(PIECE_UNICODE)) pieceDataURI[p] = svgDataUriForChar(p,120);
+
+      function createBoard(){
+        boardEl.innerHTML = '';
+        for(let r=0;r<8;r++){
+          for(let f=0;f<8;f++){
+            const sq = files[f]+ranks[r];
+            const cell = document.createElement('div');
+            cell.className = 'square ' + (((r+f)%2===0)?'light':'dark');
+            cell.dataset.square = sq;
+            const coord = document.createElement('div'); coord.className='coord'; coord.textContent = sq;
+            const pieceDiv = document.createElement('div'); pieceDiv.className='piece'; pieceDiv.dataset.square = sq;
+            cell.appendChild(pieceDiv);
+            cell.appendChild(coord);
+            cell.addEventListener('click', onSquareClick);
+            boardEl.appendChild(cell);
+          }
+        }
+      }
+
+      function fenToMap(fen){
+        const parts = fen.split(' ');
+        const rows = parts[0].split('/');
+        const map = {};
+        for(let r=0;r<8;r++){
+          const row = rows[r];
+          let file = 0;
+          for(const ch of row){
+            if(!isNaN(ch)){
+              file += parseInt(ch,10);
+            } else {
+              const sq = files[file] + ranks[r];
+              map[sq] = ch;
+              file += 1;
+            }
+          }
+        }
+        return map;
+      }
+
+      function renderFen(fen){
+        const map = fenToMap(fen);
+        for(const pd of boardEl.querySelectorAll('.piece')){
+          const sq = pd.dataset.square;
+          pd.innerHTML = '';
+          if(map[sq]){
+            const img = document.createElement('img');
+            img.src = pieceDataURI[map[sq]];
+            img.style.width = '80%'; img.style.height='80%'; img.draggable=false;
+            pd.appendChild(img);
+          }
+        }
+      }
+
+      function clearHighlights(){
+        boardEl.querySelectorAll('.highlight').forEach(el=>el.classList.remove('highlight'));
+      }
+
+      function onSquareClick(e){
+        if(gameOver) return; // ignore clicks when game finished
+        const sq = e.currentTarget.dataset.square;
+        if(!selected){
+          // pick up if there is a piece of the player's turn — we won't enforce color; backend does
+          selected = {sq, el: e.currentTarget};
+          e.currentTarget.classList.add('highlight');
+          setStatus('Selected ' + sq);
+        } else {
+          const from = selected.sq; const to = sq;
+          clearHighlights(); selected = null;
+          setStatus('Moving ' + from + to + '...');
+          // naive promotion: if moving to last rank and no promotion specified, append q
+          let uci = from + to;
+          const toRank = to[1];
+          // send to server
+          const depth = parseInt(document.getElementById('depth').value,10) || 3;
+          fetch('/move', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({move: uci, max_depth: depth})})
+            .then(r=>r.json()).then(resp=>{
+              if(!resp.ok){ setStatus('Move rejected: ' + (resp.error||'unknown')); return; }
+              renderFen(resp.fen);
+              setStatus('Bot played ' + (resp.bot_move || 'none'));
+            }).catch(err=>{ setStatus('Server error: '+err); });
+        }
+      }
+
+      document.getElementById('reset').addEventListener('click', ()=>{
+        fetch('/reset', {method:'POST'}).then(r=>r.json()).then(resp=>{ if(resp.ok){ renderFen(resp.fen); setStatus('Reset'); }});
+      });
+
+      // endgame overlay controls
+      const overlay = document.getElementById('endgame-overlay');
+      const overlayTitle = document.getElementById('endgame-title');
+      const overlayMsg = document.getElementById('endgame-msg');
+      document.getElementById('endgame-reset').addEventListener('click', ()=>{
+        fetch('/reset', {method:'POST'}).then(r=>r.json()).then(resp=>{ if(resp.ok){ renderFen(resp.fen); setStatus('New game'); hideOverlay(); gameOver=false; }});
+      });
+
+      function showOverlay(title, msg){
+        overlayTitle.textContent = title;
+        overlayMsg.textContent = msg;
+        overlay.style.display = 'flex';
+      }
+
+      function hideOverlay(){ overlay.style.display = 'none'; }
+
+      // initial load
+      createBoard();
+      fetch('/state').then(r=>r.json()).then(s=>{ renderFen(s.fen); setStatus('Ready — ' + s.turn + ' to move'); if(s.game_over){ gameOver=true; showOverlay('Game over', s.result || 'Game finished'); }}).catch(()=>{ setStatus('Could not load state from server'); });
+    </script>
+  </body>
+</html>
